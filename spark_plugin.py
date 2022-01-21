@@ -38,6 +38,12 @@ YARN_MASTER_APP_PATH = "/ws/v1/cluster/apps"
 HTTP_404_ERROR = "Error 404"
 
 
+def _remove_prefix(input_string, prefix):
+    if prefix and input_string.startswith(prefix):
+        return input_string[len(prefix):]
+    return input_string
+
+
 def _validate_url(url):
     return url.startswith("http://")
 
@@ -192,12 +198,15 @@ class SparkProcessPlugin(object):
     def __init__(self):
         self.global_dimensions = {}
         self.spark_agent = SparkAgent()
+        self.metric_address = ""
         self.metric_sink = MetricSink()
         self.master_port = None
         self.worker_ports = []
+        self.driver_ports = []
         self.enhanced_flag = False
         self.include = set()
         self.exclude = set()
+        self.prefix = ""
 
     def configure(self, config_map):
         """
@@ -227,6 +236,10 @@ class SparkProcessPlugin(object):
                 collectd.info("WorkerPort(s) detected")
                 for port in value:
                     self.worker_ports.append(str(int(port)))
+            elif key == "DriverPorts":
+                collectd.info("DriverPorts(s) detected")
+                for port in value:
+                    self.driver_ports.append(str(int(port)))
             elif key == "Dimensions" or key == "Dimension":
                 self.global_dimensions.update(_dimensions_str_to_dict(value))
             elif key == "EnhancedMetrics" and value == "True":
@@ -253,10 +266,20 @@ class SparkProcessPlugin(object):
         if not resp:
             return []
 
+        # For drivers, build the metrics prefix
+        if process == "driver":
+            apps_resp = self.spark_agent.request_metrics(self.metric_address + ":" + args[0], APPS_ENDPOINT)
+            if len(apps_resp) != 1:
+                collectd.error("Expected to find one app on the driver, but found %s" % (len(apps_resp)))
+                return []
+
+            app_id = apps_resp[0].get("id")
+            self.prefix = app_id + ".driver."
+
         dim = {"spark_process": process}
 
         if args:
-            dim["worker_port"] = args[0]
+            dim[process + "_port"] = args[0]
 
         dim.update(self.global_dimensions)
 
@@ -265,31 +288,51 @@ class SparkProcessPlugin(object):
         for key, (metric_type, metric_type_cat, metric_key) in metrics.SPARK_PROCESS_METRICS.items():
 
             data = resp[metric_type_cat]
-            if key not in data:
+            # self.prefix is only set for drivers
+            if self.prefix+key not in data:
                 continue
 
             metric_name = key
-            metric_value = data[key][metric_key]
+            metric_value = data[self.prefix+key][metric_key]
 
             metric_records.append(MetricRecord(metric_name, metric_type, metric_value, dim))
 
         if not self.enhanced_flag and len(self.include) == 0:
             return metric_records
 
-        for key, (metric_type, metric_type_cat, metric_key) in metrics.SPARK_PROCESS_METRICS_ENHANCED.items():
+        # For enhanced drivers, the ask from the field is to push everything
+        if process == "driver":
+            # If enhanced flag is enabled, push all gauges and counters metrics
+            enhanced_metrics = {"gauges": ("gauge", "value"), "counters": ("counter", "count")}
+            for metrics_type, (metric_type, metric_val_type) in enhanced_metrics.items():
+                metrics_dict = resp[metrics_type]
+                for key, val in metrics_dict.items():
+                    metric_name = _remove_prefix(key, self.prefix)
+                    # Don't resend metrics we already sent by default
+                    if metric_name in metrics.SPARK_PROCESS_METRICS.keys():
+                        continue
+                    if metric_name in self.exclude:
+                        continue
+                    if len(self.include) > 0 and metric_name not in self.include:
+                        continue
 
-            data = resp[metric_type_cat]
-            if key not in data:
-                continue
-            if key in self.exclude:
-                continue
-            if len(self.include) > 0 and key not in self.include:
-                continue
+                    metric_value = metrics_dict[key][metric_val_type]
+                    metric_records.append(MetricRecord(metric_name, metric_type, metric_value, dim))
+        else:
+            for key, (metric_type, metric_type_cat, metric_key) in metrics.SPARK_PROCESS_METRICS_ENHANCED.items():
 
-            metric_name = key
-            metric_value = data[key][metric_key]
+                data = resp[metric_type_cat]
+                if key not in data:
+                    continue
+                if key in self.exclude:
+                    continue
+                if len(self.include) > 0 and key not in self.include:
+                    continue
 
-            metric_records.append(MetricRecord(metric_name, metric_type, metric_value, dim))
+                metric_name = key
+                metric_value = data[key][metric_key]
+
+                metric_records.append(MetricRecord(metric_name, metric_type, metric_value, dim))
 
         return metric_records
 
@@ -311,6 +354,13 @@ class SparkProcessPlugin(object):
                 worker_resp = self.spark_agent.request_metrics(worker, WORKER_PATH)
                 worker_metrics = self.get_metrics(worker_resp, "worker", worker_port)
                 self.post_metrics(worker_metrics)
+
+        if self.driver_ports:
+            for driver_port in self.driver_ports:
+                driver = self.metric_address + ":" + driver_port
+                driver_resp = self.spark_agent.request_metrics(driver, WORKER_PATH)
+                driver_metrics = self.get_metrics(driver_resp, "driver", driver_port)
+                self.post_metrics(driver_metrics)
 
     def post_metrics(self, metrics):
         """
@@ -335,6 +385,8 @@ class SparkApplicationPlugin(object):
         self.enhanced_flag = False
         self.include = set()
         self.exclude = set()
+        self.metric_address = ""
+        self.driver_ports = []
 
     def configure(self, config_map):
         """
@@ -345,11 +397,8 @@ class SparkApplicationPlugin(object):
         """
         collectd.info("Configuring Spark Application Plugin ...")
 
-        required_keys = ("Cluster", "Master")
-
-        for key in required_keys:
-            if key not in config_map:
-                raise ValueError("Missing required config setting: %s" % key)
+        if "Cluster" not in config_map and ("Master" not in config_map or "Driver" not in config_map):
+            raise ValueError("Missing required config setting, expecting Cluster Type with Master or Driver")
 
         for key, value in config_map.items():
             if key == "Cluster":
@@ -375,6 +424,13 @@ class SparkApplicationPlugin(object):
                 _add_metrics_to_set(self.include, value)
             elif key == "ExcludeMetrics":
                 _add_metrics_to_set(self.exclude, value)
+            elif key == METRIC_ADDRESS:
+                if not _validate_url(value):
+                    raise ValueError("URL is not prefixed with http://")
+                self.metric_address = value
+            elif key == "DriverPorts":
+                for port in value:
+                    self.driver_ports.append(str(int(port)))
 
         collectd.info("Successfully configured Spark Application Plugin")
 
@@ -441,6 +497,24 @@ class SparkApplicationPlugin(object):
             self.metrics[(app_name, app_user)] = {}
         return apps
 
+    def _get_driver_apps(self, driver_port):
+        """
+        Retrieve all applications from driver; used for DataBricks deployment
+        """
+        resp = self.spark_agent.request_metrics(self.metric_address + ":" + driver_port, APPS_ENDPOINT)
+        apps = {}
+
+        for app in resp:
+            app_id = app.get("id")
+            app_name = app.get("name")
+            # not sure if this is the right sure, need more infor about attempt
+            app_user = app.get("attempts")[0].get("sparkUser")
+
+            if app_id and app_name and app_user:
+                apps[app_id] = (app_name, app_user, self.metric_address + ":" + driver_port)
+                self.metrics[(app_name, app_user)] = {}
+        return apps
+
     def _get_mesos_apps(self):
         """
         Retrieve all applications corresponding to Spark mesos cluster
@@ -490,6 +564,11 @@ class SparkApplicationPlugin(object):
             collectd.info("Cluster mode not defined")
             return []
         if self.cluster_mode == SPARK_STANDALONE_MODE:
+            driver_apps = {}
+            if self.driver_ports:
+                for driver_port in self.driver_ports:
+                    driver_apps.update(self._get_driver_apps(driver_port))
+                return driver_apps
             return self._get_standalone_apps()
         elif self.cluster_mode == SPARK_MESOS_MODE:
             return self._get_mesos_apps()
